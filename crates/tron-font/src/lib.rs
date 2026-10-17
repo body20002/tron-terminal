@@ -12,6 +12,7 @@ pub mod sprite;
 
 use foldhash::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use fontique::{
     Attributes, Blob, Collection, CollectionOptions, FallbackKey, FontStyle, FontWeight, FontWidth, GenericFamily,
@@ -135,8 +136,8 @@ struct Face {
     skew: Option<f32>,
     /// Variable font axis values: matcher choices merged with user settings.
     variations: Vec<([u8; 4], f32)>,
-    shaper: Option<harfrust::ShaperData>,
-    instance: Option<harfrust::ShaperInstance>,
+    /// The face at its variation location, built on first shape. Holds the shaper's layout cache.
+    shaper: Option<harfrust::Font>,
 }
 
 impl Face {
@@ -161,7 +162,7 @@ pub struct FontSystem {
     size_pt: f32,
     scale_factor: f64,
     features: Vec<harfrust::Feature>,
-    buffer: Option<harfrust::UnicodeBuffer>,
+    buffer: Option<harfrust::Buffer>,
     scaler: ScaleContext,
     size_px: f32,
     hint: bool,
@@ -435,32 +436,31 @@ impl FontSystem {
     pub fn shape_directional(&mut self, face: u32, text: &str, rtl: bool, out: &mut Vec<ShapedGlyph>) {
         out.clear();
         let size_px = self.size_px;
-        let Face { blob, index, shaper, instance, variations, .. } = &mut self.faces[face as usize];
-        let Ok(font) = harfrust::FontRef::from_index(blob.data(), *index) else { return };
-        let data = shaper.get_or_insert_with(|| harfrust::ShaperData::new(&font));
-        let instance = instance.get_or_insert_with(|| {
-            harfrust::ShaperInstance::from_variations(
-                &font,
-                variations
-                    .iter()
-                    .map(|(tag, value)| harfrust::Variation { tag: harfrust::Tag::new(tag), value: *value }),
-            )
-        });
-        let shaper = data.shaper(&font).instance(Some(instance)).build();
+        let Face { blob, index, shaper, variations, .. } = &mut self.faces[face as usize];
+        if shaper.is_none() {
+            let data: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(blob.clone());
+            let Some(font) = harfrust::Font::new(data, *index) else { return };
+            let variations = variations.iter().map(|(tag, value)| (harfrust::Tag::new(tag), *value));
+            *shaper = Some(font.instance_builder().variations(variations).build());
+        }
+        let Some(font) = shaper else { return };
+        let shaper = harfrust::ShaperFont::new(font);
         let mut buffer = self.buffer.take().unwrap_or_default();
         buffer.push_str(text);
         buffer.set_direction(if rtl { harfrust::Direction::RightToLeft } else { harfrust::Direction::LeftToRight });
         buffer.guess_segment_properties();
-        let glyphs = shaper.shape(buffer, harfrust::ShapeOptions::new().features(&self.features));
-        let scale = size_px / shaper.units_per_em().max(1) as f32;
-        out.extend(glyphs.glyph_infos().iter().zip(glyphs.glyph_positions()).map(|(info, pos)| ShapedGlyph {
-            glyph: GlyphKey { face, glyph: info.glyph_id as u16 },
-            cluster: info.cluster,
-            x_offset: pos.x_offset as f32 * scale,
-            y_offset: pos.y_offset as f32 * scale,
-            x_advance: pos.x_advance as f32 * scale,
-        }));
-        self.buffer = Some(glyphs.clear());
+        if harfrust::shape(&shaper, &mut buffer, harfrust::ShapeOptions::new().features(&self.features)).is_ok() {
+            let scale = size_px / shaper.units_per_em().max(1) as f32;
+            out.extend(buffer.glyph_infos().iter().zip(buffer.glyph_positions()).map(|(info, pos)| ShapedGlyph {
+                glyph: GlyphKey { face, glyph: info.glyph_id as u16 },
+                cluster: info.cluster,
+                x_offset: pos.x_offset as f32 * scale,
+                y_offset: pos.y_offset as f32 * scale,
+                x_advance: pos.x_advance as f32 * scale,
+            }));
+        }
+        buffer.clear();
+        self.buffer = Some(buffer);
     }
 
     /// Draws a box drawing, block or Powerline character to fit the cell.
@@ -597,7 +597,7 @@ impl FontSystem {
         let font = FontRef::from_index(blob.data(), index as usize)?;
         let (offset, key) = (font.offset, font.key);
         let face = self.faces.len() as u32;
-        self.faces.push(Face { blob, index, offset, key, embolden, skew, variations, shaper: None, instance: None });
+        self.faces.push(Face { blob, index, offset, key, embolden, skew, variations, shaper: None });
         self.face_ids.insert(id, face);
         Some(face)
     }
@@ -737,10 +737,10 @@ fn downscale(glyph: &RasterizedGlyph, scale: f32) -> RasterizedGlyph {
 
 /// The Unicode script of `ch`, as the shaper determines it.
 fn script_of(ch: char) -> Script {
-    let mut buffer = harfrust::UnicodeBuffer::new();
-    buffer.add(ch, 0);
+    let mut buffer = harfrust::Buffer::new();
+    buffer.push(ch.into(), 0);
     buffer.guess_segment_properties();
-    Script::from_bytes(buffer.script().tag().to_be_bytes())
+    Script::from_bytes(buffer.script().unwrap_or(harfrust::Script::UNKNOWN).tag().to_be_bytes())
 }
 
 /// Installed families whose default face is monospaced, for systems without `fc-list`.

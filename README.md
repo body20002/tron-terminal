@@ -95,7 +95,7 @@ answers every question and `--uninstall` removes tron again. See
 
 ## Building
 
-Requires Rust 1.98 or newer. `tic` from ncurses is used at runtime to install
+Requires Rust 1.99 or newer. `tic` from ncurses is used at runtime to install
 the bundled terminfo entry.
 
 On Linux, install the development files for Wayland, xkbcommon and fontconfig:

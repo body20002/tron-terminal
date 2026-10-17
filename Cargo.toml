@@ -7,7 +7,7 @@ default-members = ["crates/tron"]
 [workspace.package]
 version = "0.4.4"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 authors = ["Ö. Efe D."]
 repository = "https://github.com/skyline69/tron-terminal"
@@ -22,29 +22,29 @@ tron-config = { path = "crates/tron-config" }
 tron-startup = { path = "crates/tron-startup" }
 tron-inspect = { path = "crates/tron-inspect" }
 
-accesskit = "0.25.0"
-accesskit_macos = "0.27.0"
-accesskit_unix = "0.23.0"
+accesskit = "0.25.1"
+accesskit_macos = "0.27.1"
+accesskit_unix = "0.24.0"
 anyhow = "1.0.104"
-arboard = { version = "3.6.1", default-features = false }
+arboard = { version = "3.7.0", default-features = false }
 base64 = "0.23.1"
 bitflags = "2.13.2"
-clap = { version = "4.6.6", features = ["derive"] }
-clap_complete = "4.6.9"
+clap = { version = "4.6.7", features = ["derive"] }
+clap_complete = "4.6.11"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 foldhash = "0.2.0"
 gif = "0.14.2"
-fontique = "0.11.1"
-harfrust = "0.13.3"
+fontique = "0.12.0"
+harfrust = "0.14.0"
 log = "0.4.34"
 env_logger = "0.11.11"
-egui = "0.36.2"
-egui-wgpu = { version = "0.36.2", default-features = false }
+egui = "0.37.0"
+egui-wgpu = { version = "0.37.0", default-features = false }
 etcetera = "0.11.0"
 memchr = "2.8.3"
 miniz_oxide = "0.9.1"
 notify = "9.0.0-rc.5"
-objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
+objc2 = { version = "0.6.5", default-features = false, features = ["std"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "std",
     "NSApplication",
@@ -78,13 +78,13 @@ png = "0.18.1"
 ratatui = "0.30.2"
 tachyonfx = { version = "0.25.2", default-features = false, features = ["std", "std-duration"] }
 pollster = "1.0.1"
-rustix = { version = "1.1.4", features = ["pty", "termios", "process", "fs", "stdio", "shm", "mm", "param"] }
+rustix = { version = "1.1.5", features = ["pty", "termios", "process", "fs", "stdio", "shm", "mm", "param"] }
 smithay-clipboard = "0.7.3"
 serde = { version = "1.0.229", features = ["derive"] }
 swash = "0.2.10"
-thiserror = "2.0.20"
-toml = "1.1.6"
-toml_edit = "0.25.15"
+thiserror = "2.0.21"
+toml = "1.1.8"
+toml_edit = "0.25.17"
 unicode-bidi = "0.3.18"
 unicode-width = "0.2.2"
 wgpu = "30.0.1"
