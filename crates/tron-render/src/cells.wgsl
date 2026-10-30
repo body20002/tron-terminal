@@ -1,6 +1,11 @@
-// Draws every terminal element as an instanced quad in a single draw call:
-// solid rectangles (backgrounds, cursor, decorations), coverage masks (text)
-// and color bitmaps (emoji).
+// Draws every terminal element as an instanced quad: solid rectangles
+// (backgrounds, cursor, decorations), coverage masks (text) and color bitmaps
+// (emoji).
+//
+// Row quads are relative to their row's top. The high bits of `kind` hold the
+// slot they were written to: 0 for quads placed in absolute pixels, 1 for the
+// row above the viewport, 2 and up for the screen rows as a ring that starts at
+// `u.ring.x`. A scroll moves the ring instead of the quads.
 
 struct Uniforms {
     // xy: surface size in pixels.
@@ -8,6 +13,10 @@ struct Uniforms {
     // Block cursor rectangle in pixels (min xy, max xy). Text inside uses cursor_text.
     cursor_rect: vec4<f32>,
     cursor_text: vec4<f32>,
+    // Top padding, cell height, smooth scroll offset.
+    grid: vec4<f32>,
+    // Ring position of row 0, number of rows.
+    ring: vec4<u32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -44,14 +53,22 @@ struct VertexOut {
 fn vs_main(@builtin(vertex_index) index: u32, inst: Instance) -> VertexOut {
     // Triangle strip corners: (0,0) (1,0) (0,1) (1,1).
     let corner = vec2<f32>(f32(index & 1u), f32((index >> 1u) & 1u));
-    let pixel = inst.pos + corner * inst.size;
+    let slot = inst.kind >> 8u;
+    var pos = inst.pos;
+    if slot == 1u {
+        pos.y += (u.grid.x + u.grid.z) - u.grid.y;
+    } else if slot >= 2u {
+        let row = f32((slot - 2u + u.ring.y - u.ring.x) % u.ring.y);
+        pos.y += (u.grid.x + row * u.grid.y) + u.grid.z;
+    }
+    let pixel = pos + corner * inst.size;
     let ndc = pixel / u.viewport.xy * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
 
     var out: VertexOut;
     out.position = vec4<f32>(ndc, 0.0, 1.0);
     out.uv = mix(inst.uv.xy, inst.uv.zw, corner);
     out.color = inst.color;
-    out.kind = inst.kind;
+    out.kind = inst.kind & 0xffu;
     out.local = corner * inst.size;
     out.params = inst.uv;
     return out;

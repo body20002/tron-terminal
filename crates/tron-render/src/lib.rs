@@ -5,8 +5,9 @@
 //! decorations, images above text. With user shaders configured, the pass
 //! renders into a texture that the shader chain then processes.
 //!
-//! Cell instances are cached per row and rebuilt only for damaged rows; rows
-//! the screen scrolled keep their instances and move up with it.
+//! Cell instances are cached per row and rebuilt only for damaged rows. Each row
+//! has its own slot in the GPU buffer and only changed rows are written; the
+//! slots form a ring, so a scroll moves the ring's start, not the instances.
 
 mod atlas;
 mod cells;
@@ -958,11 +959,10 @@ impl Renderer {
                 })],
                 ..Default::default()
             });
-            let (backgrounds, text) = self.cells.ranges();
             self.images.draw(&mut pass, Layer::BelowBackground);
-            self.cells.draw(&mut pass, backgrounds);
+            self.cells.draw_backgrounds(&mut pass);
             self.images.draw(&mut pass, Layer::BelowText);
-            self.cells.draw(&mut pass, text);
+            self.cells.draw_text(&mut pass);
             self.images.draw(&mut pass, Layer::AboveText);
         }
         let time = self.started.elapsed().as_secs_f32();

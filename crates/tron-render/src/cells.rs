@@ -50,6 +50,75 @@ struct Uniforms {
     viewport: [f32; 4],
     cursor_rect: [f32; 4],
     cursor_text: [f32; 4],
+    /// Top padding, cell height and smooth scroll offset in pixels: where rows go.
+    grid: [f32; 4],
+    /// Ring position of row 0, and the number of rows. See [`Slots`].
+    ring: [u32; 4],
+}
+
+/// Where instances live in the GPU buffer.
+///
+/// Every row has a slot of fixed size for its backgrounds and one for its
+/// foregrounds, so a changed row is written in place and nothing else moves.
+/// Slot 0 holds the row above the viewport while smooth scrolling; slots 1.. are
+/// the screen rows as a ring, so a scroll moves the ring's start instead of
+/// any instances. Row instances are relative to the row top and the shader
+/// places them from their slot. Room a row does not use holds empty quads.
+/// The cursor and what is drawn above the text follow, with absolute positions.
+#[derive(Copy, Clone, Default, PartialEq, Debug)]
+struct Slots {
+    /// Slots in each of the two regions: one per row, plus the overscan row.
+    count: usize,
+    background: usize,
+    foreground: usize,
+    cursor: usize,
+    above: usize,
+}
+
+impl Slots {
+    /// A layout for `count` slots holding at least the given numbers of quads.
+    /// Room only grows while the number of rows stays the same, so rows that
+    /// vary in length do not move everything back and forth.
+    fn fit(self, count: usize, background: usize, foreground: usize, cursor: usize, above: usize) -> Self {
+        let room = |need: usize, min: usize, current: usize| {
+            let wanted = need.next_power_of_two().max(min);
+            if self.count == count && current >= need { current } else { wanted }
+        };
+        Self {
+            count,
+            background: room(background, 16, self.background),
+            foreground: room(foreground, 16, self.foreground),
+            cursor: room(cursor, 8, self.cursor),
+            above: room(above, 64, self.above),
+        }
+    }
+
+    fn background_start(self) -> usize {
+        0
+    }
+
+    fn foreground_start(self) -> usize {
+        self.count * self.background
+    }
+
+    fn cursor_start(self) -> usize {
+        self.count * (self.background + self.foreground)
+    }
+
+    fn above_start(self) -> usize {
+        self.cursor_start() + self.cursor
+    }
+
+    fn len(self) -> usize {
+        self.above_start() + self.above
+    }
+}
+
+/// One of the two kinds of row slots.
+#[derive(Copy, Clone)]
+enum Region {
+    Background,
+    Foreground,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -236,7 +305,7 @@ struct GlyphEntry {
     top: i32,
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq)]
 struct RowInstances {
     background: Vec<Instance>,
     foreground: Vec<Instance>,
@@ -328,7 +397,6 @@ pub struct CellPipeline {
     bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
     instance_buffer: wgpu::Buffer,
-    instance_capacity: usize,
     mask_atlas: Atlas,
     color_atlas: Atlas,
     max_atlas_size: u32,
@@ -343,11 +411,32 @@ pub struct CellPipeline {
     /// How far down the grid is drawn, in pixels, between none and one cell:
     /// smooth scrolling sits the viewport between two lines.
     scroll_offset: f32,
-    frame: Vec<Instance>,
-    /// The frame and uniforms last written to the GPU.
-    uploaded: Vec<Instance>,
+    /// Where the instances live in the GPU buffer.
+    layout: Slots,
+    /// The layout changed: the buffer is new and every slot must be written.
+    relayout: bool,
+    /// Ring position of row 0: row `y` is drawn from slot `1 + (y + ring) % rows`.
+    ring: usize,
+    /// Slots whose instances changed since the last upload.
+    dirty: Vec<bool>,
+    /// The overscan slot holds the row above the viewport.
+    overscan_shown: bool,
+    /// The slot whose row is cut at the bottom of the grid while smooth scrolling.
+    clipped: Option<usize>,
+    /// Smooth scroll offset of the frame: zero unless the overscan row shows.
+    scroll: f32,
+    /// A row built this frame, swapped with the one it replaces when they differ.
+    spare: RowInstances,
+    /// Cursor quads, and quads above the text: overlays, scrollbar, glow line, flash.
+    cursor_quads: Vec<Instance>,
+    above: Vec<Instance>,
+    /// What was last written to the GPU besides the row slots.
+    uploaded_cursor: Vec<Instance>,
+    uploaded_above: Vec<Instance>,
     uploaded_uniforms: Uniforms,
-    split: usize,
+    /// Quads in the frame, and how many of them are backgrounds and cursor.
+    counts: (usize, usize),
+    scratch: Vec<Instance>,
     uniforms: Uniforms,
     metrics: CellMetrics,
     padding: [f32; 2],
@@ -450,7 +539,6 @@ impl CellPipeline {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let instance_capacity = 4096;
         let mask_atlas = Atlas::new(device, "mask atlas", wgpu::TextureFormat::R8Unorm, INITIAL_ATLAS_SIZE);
         let color_atlas = Atlas::new(device, "color atlas", wgpu::TextureFormat::Rgba8Unorm, INITIAL_ATLAS_SIZE);
         let bind_group = create_bind_group(device, &bind_group_layout, &uniform_buffer, &mask_atlas, &color_atlas);
@@ -459,8 +547,7 @@ impl CellPipeline {
             bind_group_layout,
             bind_group,
             uniform_buffer,
-            instance_buffer: create_instance_buffer(device, instance_capacity),
-            instance_capacity,
+            instance_buffer: create_instance_buffer(device, 0),
             mask_atlas,
             color_atlas,
             max_atlas_size: device.limits().max_texture_dimension_2d.min(8192),
@@ -471,10 +558,21 @@ impl CellPipeline {
             rows: Vec::new(),
             overscan: RowInstances::default(),
             scroll_offset: 0.0,
-            frame: Vec::new(),
-            uploaded: Vec::new(),
+            layout: Slots::default(),
+            relayout: false,
+            ring: 0,
+            dirty: Vec::new(),
+            overscan_shown: false,
+            clipped: None,
+            scroll: 0.0,
+            spare: RowInstances::default(),
+            cursor_quads: Vec::new(),
+            above: Vec::new(),
+            uploaded_cursor: Vec::new(),
+            uploaded_above: Vec::new(),
             uploaded_uniforms: Uniforms::zeroed(),
-            split: 0,
+            counts: (0, 0),
+            scratch: Vec::new(),
             uniforms: Uniforms::zeroed(),
             metrics,
             padding,
@@ -624,6 +722,7 @@ impl CellPipeline {
             return;
         }
         self.rows.rotate_left(shift);
+        self.ring = (self.ring + shift) % self.rows.len();
         // The row the cursor was drawn in moved too, or left the screen.
         self.last_cursor = self.last_cursor.and_then(|(row, col)| Some((row.checked_sub(shift)?, col)));
     }
@@ -657,8 +756,10 @@ impl CellPipeline {
         let rows = snapshot.rows();
         if self.rows.len() != rows {
             self.rows.resize_with(rows, RowInstances::default);
+            self.ring = 0;
             self.full_rebuild = true;
         }
+        self.dirty.resize(rows + 1, false);
         if snapshot.palette_generation != self.palette_generation {
             self.palette_generation = snapshot.palette_generation;
             self.full_rebuild = true;
@@ -706,7 +807,7 @@ impl CellPipeline {
                     .as_ref()
                     .is_some_and(|h| h.id.is_some() || (h.start.line..=h.end.line).contains(&line));
             let key = (!highlighted).then(|| row_key(row, cursor_col));
-            let mut instances = std::mem::take(&mut self.rows[y]);
+            let mut instances = std::mem::take(&mut self.spare);
             if let Some(cached) = key.and_then(|k| self.row_cache.get(&k)) {
                 // Scrolled content: same cells as a row built earlier, reuse its instances.
                 instances.background.clone_from(&cached.background);
@@ -723,7 +824,13 @@ impl CellPipeline {
                     self.row_cache.insert(key, copy);
                 }
             }
-            self.rows[y] = instances;
+            // A row built the same as before keeps its slot as it is.
+            if instances != self.rows[y] {
+                std::mem::swap(&mut self.rows[y], &mut instances);
+                let slot = self.slot(y);
+                self.dirty[slot] = true;
+            }
+            self.spare = instances;
         }
         self.full_rebuild = false;
         self.last_cursor = cursor_cell;
@@ -749,47 +856,36 @@ impl CellPipeline {
             self.overscan.foreground.clear();
         }
 
-        // Row instances are relative to the row top; place them now.
+        // Rows are placed by the shader from their slot; only the rows hanging over
+        // the top or the bottom of the grid while smooth scrolling are cut here.
         let cell_h = self.metrics.height as f32;
         let padding_top = self.padding[1];
-        // Rows hanging over the top or the bottom of the grid are cut at its edges.
         let (top, bottom) = (padding_top, padding_top + rows as f32 * cell_h);
+        let row_offset = |y: usize| padding_top + (y as f32 * cell_h) + scroll;
+        self.scroll = scroll;
+        // The overscan slot is cut to the grid, so it changes with every offset.
+        if scroll > 0.0 || self.overscan_shown {
+            self.dirty[0] = true;
+        }
+        self.overscan_shown = scroll > 0.0;
+        // Only the last row can hang over the bottom edge.
+        let clipped = (scroll > 0.0).then(|| self.slot(rows - 1));
+        for slot in [self.clipped, clipped].into_iter().flatten() {
+            self.dirty[slot] = true;
+        }
+        self.clipped = clipped;
+
+        self.cursor_quads.clear();
+        let cursor_rect = self.push_cursor(snapshot, &colors, focused);
+        if scroll > 0.0 {
+            clip_range(&mut self.cursor_quads, 0, top, bottom);
+        }
+
+        self.above.clear();
         let shifted = |instance: &Instance, offset: f32| Instance {
             pos: [instance.pos[0], instance.pos[1] + offset],
             ..*instance
         };
-        let place = |frame: &mut Vec<Instance>, instances: &[Instance], offset: f32, clip: bool| {
-            for instance in instances {
-                let moved = shifted(instance, offset);
-                match clip {
-                    true => frame.extend(clip_vertical(moved, top, bottom)),
-                    false => frame.push(moved),
-                }
-            }
-        };
-        let row_offset = |y: usize| padding_top + (y as f32 * cell_h) + scroll;
-        // Only the first and the last row can hang over an edge.
-        let clipped = |y: usize| scroll > 0.0 && y + 1 == rows;
-        self.frame.clear();
-        if scroll > 0.0 {
-            place(&mut self.frame, &self.overscan.background, row_offset(0) - cell_h, true);
-        }
-        for (y, row) in self.rows.iter().enumerate() {
-            place(&mut self.frame, &row.background, row_offset(y), clipped(y));
-        }
-        let cursor_start = self.frame.len();
-        let cursor_rect = self.push_cursor(snapshot, &colors, focused);
-        if scroll > 0.0 {
-            clip_range(&mut self.frame, cursor_start, top, bottom);
-        }
-        self.split = self.frame.len();
-        if scroll > 0.0 {
-            place(&mut self.frame, &self.overscan.foreground, row_offset(0) - cell_h, true);
-        }
-        for (y, row) in self.rows.iter().enumerate() {
-            place(&mut self.frame, &row.foreground, row_offset(y), clipped(y));
-        }
-
         // Overlays (search bar, IME preedit) are drawn above the terminal text.
         if !self.overlays.is_empty() {
             let overlays = std::mem::take(&mut self.overlays);
@@ -803,14 +899,14 @@ impl CellPipeline {
                 let row = overlay_row(overlay, snapshot.cols);
                 self.build_row(&row, i64::MIN, None, &colors, fonts, queue, &mut instances);
                 let offset = row_offset(overlay.row);
-                self.frame.extend(instances.background.iter().chain(&instances.foreground).map(|i| shifted(i, offset)));
+                self.above.extend(instances.background.iter().chain(&instances.foreground).map(|i| shifted(i, offset)));
             }
             self.overlay_instances = instances;
             self.overlays = overlays;
         }
         if let Some(bar) = self.scrollbar {
             let [r, g, b, _] = colors.rgba(bar.color);
-            self.frame.push(Instance {
+            self.above.push(Instance {
                 pos: [bar.x, bar.y],
                 size: [bar.width, bar.height],
                 // Corner radius, then the size the shader measures the rounded box in.
@@ -836,7 +932,7 @@ impl CellPipeline {
             let near = (line.head - tail).max(0.0);
             let right_far = line.head.min(viewport[0] - line.center);
             if right_far > near {
-                self.frame.push(streak(
+                self.above.push(streak(
                     line.center + near,
                     line.center + right_far,
                     brightness(near),
@@ -845,7 +941,7 @@ impl CellPipeline {
             }
             let left_far = line.head.min(line.center);
             if left_far > near {
-                self.frame.push(streak(
+                self.above.push(streak(
                     line.center - left_far,
                     line.center - near,
                     brightness(left_far),
@@ -854,15 +950,75 @@ impl CellPipeline {
             }
         }
         if self.flash > 0.0 {
-            self.frame.push(solid(0.0, 0.0, viewport[0], viewport[1], [1.0, 1.0, 1.0, self.flash * 0.18]));
+            self.above.push(solid(0.0, 0.0, viewport[0], viewport[1], [1.0, 1.0, 1.0, self.flash * 0.18]));
         }
+
+        let overscan = if self.overscan_shown { Some(&self.overscan) } else { None };
+        let longest = |region: fn(&RowInstances) -> &Vec<Instance>| {
+            self.rows.iter().chain(overscan).map(|r| region(r).len()).max().unwrap_or(0)
+        };
+        let (backgrounds, foregrounds) = (longest(|r| &r.background), longest(|r| &r.foreground));
+        let layout = self.layout.fit(rows + 1, backgrounds, foregrounds, self.cursor_quads.len(), self.above.len());
+        if layout != self.layout {
+            self.layout = layout;
+            self.relayout = true;
+        }
+        let sum = |region: fn(&RowInstances) -> &Vec<Instance>| {
+            self.rows.iter().chain(overscan).map(|r| region(r).len()).sum::<usize>()
+        };
+        let behind = sum(|r| &r.background) + self.cursor_quads.len();
+        self.counts = (behind + sum(|r| &r.foreground) + self.above.len(), behind);
 
         let cursor_text = theme.cursor_text.unwrap_or(colors.palette.background);
         self.uniforms = Uniforms {
             viewport: [viewport[0], viewport[1], 0.0, 0.0],
             cursor_rect,
             cursor_text: colors.rgba(cursor_text),
+            grid: [padding_top, cell_h, scroll, 0.0],
+            ring: [self.ring as u32, rows as u32, 0, 0],
         };
+    }
+
+    /// Slot of row `y`.
+    fn slot(&self, y: usize) -> usize {
+        1 + (y + self.ring) % self.rows.len()
+    }
+
+    /// Appends the quads of `slot` in `region`, cut where the slot's row hangs over
+    /// the grid, packed with the slot number and padded with empty quads.
+    fn fill_slot(&self, region: Region, slot: usize, out: &mut Vec<Instance>) {
+        let rows = self.rows.len();
+        let (instances, row) = match slot {
+            0 => (&self.overscan, -1.0),
+            _ => {
+                let y = (slot - 1 + rows - self.ring) % rows;
+                (&self.rows[y], y as f32)
+            }
+        };
+        let (instances, room) = match region {
+            Region::Background => (&instances.background, self.layout.background),
+            Region::Foreground => (&instances.foreground, self.layout.foreground),
+        };
+        let start = out.len();
+        let pack = |instance: Instance| Instance { kind: instance.kind | ((slot as u32 + 1) << 8), ..instance };
+        let cut = slot == 0 || self.clipped == Some(slot);
+        if slot == 0 && !self.overscan_shown {
+            // Nothing above the viewport to show.
+        } else if cut {
+            // Cut against the grid in the row's own coordinates; the offset is the
+            // one the shader adds.
+            let cell_h = self.metrics.height as f32;
+            let padding_top = self.padding[1];
+            let offset = match slot {
+                0 => (padding_top + self.scroll) - cell_h,
+                _ => padding_top + (row * cell_h) + self.scroll,
+            };
+            let (top, bottom) = (padding_top - offset, padding_top + rows as f32 * cell_h - offset);
+            out.extend(instances.iter().filter_map(|&i| clip_vertical(i, top, bottom)).map(pack));
+        } else {
+            out.extend(instances.iter().copied().map(pack));
+        }
+        out.resize(start + room, Instance::zeroed());
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1208,7 +1364,7 @@ impl CellPipeline {
         let stroke = (m.underline_thickness as f32).max((cell_h / 16.0).round()).max(1.0);
 
         if !focused {
-            self.frame.extend_from_slice(&[
+            self.cursor_quads.extend_from_slice(&[
                 solid(x, y, width, stroke, color),
                 solid(x, y + cell_h - stroke, width, stroke, color),
                 solid(x, y, stroke, cell_h, color),
@@ -1218,15 +1374,15 @@ impl CellPipeline {
         }
         match cursor.shape {
             CursorShape::Block => {
-                self.frame.push(solid(x, y, width, cell_h, color));
+                self.cursor_quads.push(solid(x, y, width, cell_h, color));
                 [x, y, x + width, y + cell_h]
             }
             CursorShape::Beam => {
-                self.frame.push(solid(x, y, stroke.max(2.0), cell_h, color));
+                self.cursor_quads.push(solid(x, y, stroke.max(2.0), cell_h, color));
                 NONE
             }
             CursorShape::Underline => {
-                self.frame.push(solid(x, y + cell_h - stroke * 2.0, width, stroke * 2.0, color));
+                self.cursor_quads.push(solid(x, y + cell_h - stroke * 2.0, width, stroke * 2.0, color));
                 NONE
             }
         }
@@ -1276,28 +1432,67 @@ impl CellPipeline {
 
     /// Writes the frame to the GPU. Returns whether it differs from the last frame
     /// written; an unchanged frame is not written again.
+    /// Writes what changed to the GPU. Returns whether anything did.
     pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
-        if self.frame == self.uploaded
-            && bytemuck::bytes_of(&self.uniforms) == bytemuck::bytes_of(&self.uploaded_uniforms)
-        {
-            return false;
+        let layout = self.layout;
+        let relayout = std::mem::take(&mut self.relayout);
+        if relayout {
+            self.instance_buffer = create_instance_buffer(device, layout.len());
+            self.dirty.fill(true);
         }
-        if self.frame.len() > self.instance_capacity {
-            self.instance_capacity = self.frame.len().next_power_of_two();
-            self.instance_buffer = create_instance_buffer(device, self.instance_capacity);
+        let write = |queue: &wgpu::Queue, buffer: &wgpu::Buffer, at: usize, instances: &[Instance]| {
+            queue.write_buffer(buffer, (at * size_of::<Instance>()) as u64, bytemuck::cast_slice(instances));
+        };
+        let mut changed = relayout;
+        let mut scratch = std::mem::take(&mut self.scratch);
+        for (region, start, room) in [
+            (Region::Background, layout.background_start(), layout.background),
+            (Region::Foreground, layout.foreground_start(), layout.foreground),
+        ] {
+            // Neighboring changed slots, such as every row after a resize, go in one write.
+            let mut slot = 0;
+            while slot < self.dirty.len() {
+                if !self.dirty[slot] {
+                    slot += 1;
+                    continue;
+                }
+                let first = slot;
+                scratch.clear();
+                while slot < self.dirty.len() && self.dirty[slot] {
+                    self.fill_slot(region, slot, &mut scratch);
+                    slot += 1;
+                }
+                write(queue, &self.instance_buffer, start + first * room, &scratch);
+                changed = true;
+            }
         }
-        if !self.frame.is_empty() {
-            queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&self.frame));
+        self.scratch = scratch;
+        self.dirty.fill(false);
+        for (quads, uploaded, start, room) in [
+            (&self.cursor_quads, &mut self.uploaded_cursor, layout.cursor_start(), layout.cursor),
+            (&self.above, &mut self.uploaded_above, layout.above_start(), layout.above),
+        ] {
+            if relayout || quads != uploaded {
+                // Only as many quads as there are now get drawn; no padding needed.
+                debug_assert!(quads.len() <= room);
+                if !quads.is_empty() {
+                    write(queue, &self.instance_buffer, start, quads);
+                }
+                uploaded.clone_from(quads);
+                changed = true;
+            }
         }
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&self.uniforms));
-        self.uploaded.clone_from(&self.frame);
-        self.uploaded_uniforms = self.uniforms;
-        true
+        if bytemuck::bytes_of(&self.uniforms) != bytemuck::bytes_of(&self.uploaded_uniforms) {
+            queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&self.uniforms));
+            self.uploaded_uniforms = self.uniforms;
+            changed = true;
+        }
+        changed
     }
 
     /// Quads in the prepared frame, and how many of them are backgrounds and cursor.
     pub fn instances(&self) -> (usize, usize) {
-        (self.frame.len(), self.split)
+        self.counts
     }
 
     /// Size and rows taken of the mask and the color atlas.
@@ -1310,19 +1505,45 @@ impl CellPipeline {
         (self.glyphs.len(), self.shape_cache_len, self.row_cache.len())
     }
 
-    /// Instance range of backgrounds and cursor, then of text and decorations.
-    pub fn ranges(&self) -> (Range<u32>, Range<u32>) {
-        (0..self.split as u32, self.split as u32..self.frame.len() as u32)
+    /// Draws cell backgrounds and the cursor.
+    pub fn draw_backgrounds(&self, pass: &mut wgpu::RenderPass<'_>) {
+        let layout = self.layout;
+        self.draw_rows(pass, layout.background_start(), layout.background);
+        let start = layout.cursor_start();
+        self.draw(pass, start..start + self.uploaded_cursor.len());
     }
 
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, range: Range<u32>) {
+    /// Draws text, decorations and what lies above them.
+    pub fn draw_text(&self, pass: &mut wgpu::RenderPass<'_>) {
+        let layout = self.layout;
+        self.draw_rows(pass, layout.foreground_start(), layout.foreground);
+        let start = layout.above_start();
+        self.draw(pass, start..start + self.uploaded_above.len());
+    }
+
+    /// Draws the row slots of one region top to bottom: the overscan row, then
+    /// the ring from row 0, which may wrap around the end of the slots.
+    fn draw_rows(&self, pass: &mut wgpu::RenderPass<'_>, start: usize, room: usize) {
+        let rows = self.layout.count.saturating_sub(1);
+        if rows == 0 || rows != self.rows.len() {
+            return;
+        }
+        let slots = |first: usize, end: usize| start + first * room..start + end * room;
+        if self.overscan_shown {
+            self.draw(pass, slots(0, 1));
+        }
+        self.draw(pass, slots(1 + self.ring, 1 + rows));
+        self.draw(pass, slots(1, 1 + self.ring));
+    }
+
+    fn draw(&self, pass: &mut wgpu::RenderPass<'_>, range: Range<usize>) {
         if range.is_empty() {
             return;
         }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-        pass.draw(0..4, range);
+        pass.draw(0..4, range.start as u32..range.end as u32);
     }
 }
 
@@ -1393,7 +1614,7 @@ fn solid(x: f32, y: f32, width: f32, height: f32, color: [f32; 4]) -> Instance {
 fn create_instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("cell instances"),
-        size: (capacity * size_of::<Instance>()) as u64,
+        size: (capacity.max(1) * size_of::<Instance>()) as u64,
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     })
