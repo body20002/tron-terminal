@@ -25,7 +25,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use winit::application::ApplicationHandler;
 use winit::cursor::CursorIcon;
 use winit::data_transfer::{DataTransferId, TypeHint, TypedData};
@@ -76,6 +76,13 @@ const SCROLLBAR_FADE: Duration = Duration::from_millis(250);
 /// How often the shell's directory is read for the folder icon beside the title.
 #[cfg(target_os = "macos")]
 const REPRESENTED_DIRECTORY_POLL: Duration = Duration::from_millis(500);
+/// Most bytes read from the pty that may wait for the parser. Past this the
+/// reader stops reading, so the shell's writes block instead of piling up
+/// output that Ctrl+C could no longer stop.
+const INBOX_LIMIT: usize = 1 << 20;
+/// Most bytes parsed while holding the terminal lock, so a frame never waits
+/// long for its snapshot.
+const PARSE_SLICE: usize = 64 << 10;
 /// Link schemes opened on Ctrl+click.
 const LINK_SCHEMES: [&str; 9] =
     ["http://", "https://", "file://", "mailto:", "ftp://", "sftp://", "ssh://", "git://", "gemini://"];
@@ -181,7 +188,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// State shared between the UI thread and the pty reader thread.
+/// State shared between the UI thread and the pty reader and parser threads.
 struct Shared {
     term: Mutex<Terminal>,
     /// Set by the reader when it woke the event loop and the wake is unhandled.
@@ -3391,15 +3398,73 @@ fn spawn_writer(mut writer: File, shared: Arc<Shared>) -> io::Result<mpsc::Sende
     Ok(sender)
 }
 
+/// Bytes read from the pty that the parser has not taken yet.
+#[derive(Default)]
+struct Inbox {
+    bytes: Vec<u8>,
+    /// The pty closed; nothing more will arrive.
+    closed: bool,
+}
+
+#[derive(Default)]
+struct Pipe {
+    inbox: Mutex<Inbox>,
+    /// Signalled when bytes arrive or the pty closes.
+    filled: Condvar,
+    /// Signalled when the parser took the bytes.
+    drained: Condvar,
+}
+
+/// Starts two threads: one reads the pty, the other parses what it read.
+///
+/// The kernel holds only about 4 KiB of pty output, and the shell's writes wait
+/// while that is full. Reading without parsing in between frees it as soon as
+/// possible; the parser takes everything that arrived meanwhile in one batch.
 fn spawn_reader(
     mut reader: File,
     shared: Arc<Shared>,
     proxy: EventLoopProxy,
     responses: mpsc::Sender<Vec<u8>>,
 ) -> io::Result<()> {
-    thread::Builder::new().name("pty-reader".into()).spawn(move || {
+    let pipe = Arc::new(Pipe::default());
+    let parser_pipe = pipe.clone();
+    let parser_shared = shared.clone();
+    thread::Builder::new().name("pty-parser".into()).spawn(move || {
+        let (pipe, shared) = (parser_pipe, parser_shared);
         let mut parser = Parser::new();
-        let mut buffer = vec![0u8; 1 << 18];
+        let mut batch = Vec::new();
+        loop {
+            {
+                let mut inbox = pipe.inbox.lock();
+                while inbox.bytes.is_empty() && !inbox.closed {
+                    pipe.filled.wait(&mut inbox);
+                }
+                if inbox.bytes.is_empty() {
+                    break;
+                }
+                std::mem::swap(&mut batch, &mut inbox.bytes);
+            }
+            pipe.drained.notify_one();
+            for slice in batch.chunks(PARSE_SLICE) {
+                let reply = {
+                    let mut term = shared.term.lock();
+                    parser.advance(&mut *term, slice);
+                    term.take_responses()
+                };
+                if let Some(reply) = reply {
+                    let _ = responses.send(reply);
+                }
+                if !shared.wake_pending.swap(true, Ordering::AcqRel) {
+                    proxy.wake_up();
+                }
+            }
+            batch.clear();
+        }
+        shared.exited.store(true, Ordering::Release);
+        proxy.wake_up();
+    })?;
+    thread::Builder::new().name("pty-reader".into()).spawn(move || {
+        let mut buffer = vec![0u8; 1 << 16];
         loop {
             let n = match reader.read(&mut buffer) {
                 Ok(0) => break,
@@ -3413,20 +3478,16 @@ fn spawn_reader(
                 }
             };
             shared.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
-            let reply = {
-                let mut term = shared.term.lock();
-                parser.advance(&mut *term, &buffer[..n]);
-                term.take_responses()
-            };
-            if let Some(reply) = reply {
-                let _ = responses.send(reply);
+            let mut inbox = pipe.inbox.lock();
+            while inbox.bytes.len() >= INBOX_LIMIT {
+                pipe.drained.wait(&mut inbox);
             }
-            if !shared.wake_pending.swap(true, Ordering::AcqRel) {
-                proxy.wake_up();
-            }
+            inbox.bytes.extend_from_slice(&buffer[..n]);
+            drop(inbox);
+            pipe.filled.notify_one();
         }
-        shared.exited.store(true, Ordering::Release);
-        proxy.wake_up();
+        pipe.inbox.lock().closed = true;
+        pipe.filled.notify_one();
     })?;
     Ok(())
 }
