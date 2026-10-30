@@ -138,6 +138,9 @@ struct Face {
     variations: Vec<([u8; 4], f32)>,
     /// The face at its variation location, built on first shape. Holds the shaper's layout cache.
     shaper: Option<harfrust::Font>,
+    /// Shaping plans by direction, script and language. Building one costs more
+    /// than shaping a line of text with it.
+    plans: Vec<harfrust::ShapePlan>,
 }
 
 impl Face {
@@ -351,6 +354,10 @@ impl FontSystem {
                 }
             })
             .collect();
+        // Plans are built for the features.
+        for face in &mut self.faces {
+            face.plans.clear();
+        }
     }
 
     pub fn set_size(&mut self, size_pt: f32, scale_factor: f64) {
@@ -436,7 +443,7 @@ impl FontSystem {
     pub fn shape_directional(&mut self, face: u32, text: &str, rtl: bool, out: &mut Vec<ShapedGlyph>) {
         out.clear();
         let size_px = self.size_px;
-        let Face { blob, index, shaper, variations, .. } = &mut self.faces[face as usize];
+        let Face { blob, index, shaper, variations, plans, .. } = &mut self.faces[face as usize];
         if shaper.is_none() {
             let data: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(blob.clone());
             let Some(font) = harfrust::Font::new(data, *index) else { return };
@@ -449,7 +456,21 @@ impl FontSystem {
         buffer.push_str(text);
         buffer.set_direction(if rtl { harfrust::Direction::RightToLeft } else { harfrust::Direction::LeftToRight });
         buffer.guess_segment_properties();
-        if harfrust::shape(&shaper, &mut buffer, harfrust::ShapeOptions::new().features(&self.features)).is_ok() {
+        let matches = |plan: &harfrust::ShapePlan| {
+            plan.direction() == buffer.direction()
+                && plan.script() == buffer.script()
+                && plan.language() == buffer.language()
+        };
+        let plan = match plans.iter().position(matches) {
+            Some(found) => found,
+            None => {
+                let (direction, script, language) = (buffer.direction(), buffer.script(), buffer.language());
+                plans.push(harfrust::ShapePlan::new(font, direction, script, language, &self.features));
+                plans.len() - 1
+            }
+        };
+        let options = harfrust::ShapeOptions::new().features(&self.features).plan(Some(&plans[plan]));
+        if harfrust::shape(&shaper, &mut buffer, options).is_ok() {
             let scale = size_px / shaper.units_per_em().max(1) as f32;
             out.extend(buffer.glyph_infos().iter().zip(buffer.glyph_positions()).map(|(info, pos)| ShapedGlyph {
                 glyph: GlyphKey { face, glyph: info.glyph_id as u16 },
@@ -597,7 +618,7 @@ impl FontSystem {
         let font = FontRef::from_index(blob.data(), index as usize)?;
         let (offset, key) = (font.offset, font.key);
         let face = self.faces.len() as u32;
-        self.faces.push(Face { blob, index, offset, key, embolden, skew, variations, shaper: None });
+        self.faces.push(Face { blob, index, offset, key, embolden, skew, variations, shaper: None, plans: Vec::new() });
         self.face_ids.insert(id, face);
         Some(face)
     }
