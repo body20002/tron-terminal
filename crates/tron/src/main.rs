@@ -3522,14 +3522,23 @@ fn bind_key(key: &Key) -> Option<BindKey> {
 fn dropped_text(value: &dyn TypedData) -> Option<String> {
     match value.type_().hint() {
         Some(TypeHint::UriList) => {
-            let items: Vec<String> = match value.try_as_file_paths() {
-                Ok(paths) if !paths.is_empty() => paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
-                _ => value.try_as_uris().ok()?,
+            let uris = value.try_as_uris().ok()?;
+            let items = match uris.iter().map(|uri| file_uri_path(uri)).collect::<Option<Vec<_>>>() {
+                Some(paths) if !paths.is_empty() => paths,
+                _ => uris,
             };
             Some(items.iter().map(|item| shell_quote(item)).collect::<Vec<_>>().join(" "))
         }
         _ => value.try_as_string().ok(),
     }
+}
+
+/// Local path of a `file:` URI with an empty or `localhost` host, `%XX`
+/// escapes decoded. `None` for other URIs.
+fn file_uri_path(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    let path = rest.strip_prefix("localhost").unwrap_or(rest);
+    path.starts_with('/').then(|| percent_decode(path))
 }
 
 /// Quotes `text` for POSIX shells: single quotes, with `'` written as `'\''`.
@@ -3592,7 +3601,7 @@ fn with_app_id(attributes: WindowAttributes, event_loop: &dyn ActiveEventLoop) -
     }
 }
 
-/// Decodes `%XX` escapes in paths reported through OSC 7.
+/// Decodes `%XX` escapes in paths reported through OSC 7 or dropped as `file:` URIs.
 fn percent_decode(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -4120,5 +4129,13 @@ mod tests {
         assert_eq!(shell_quote("/tmp/a b.txt"), "'/tmp/a b.txt'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
         assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn dropped_file_uris_become_paths() {
+        assert_eq!(file_uri_path("file:///tmp/a%20b.txt").as_deref(), Some("/tmp/a b.txt"));
+        assert_eq!(file_uri_path("file://localhost/etc/hosts").as_deref(), Some("/etc/hosts"));
+        assert_eq!(file_uri_path("file://server/share/x"), None);
+        assert_eq!(file_uri_path("https://example.com/"), None);
     }
 }
