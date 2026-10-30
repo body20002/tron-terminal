@@ -378,17 +378,24 @@ impl ColorContext<'_> {
 }
 
 pub fn to_rgba(color: [u8; 3], srgb: bool) -> [f32; 4] {
-    let channel = |c: u8| {
-        let v = f32::from(c) / 255.0;
-        if !srgb {
-            v
-        } else if v <= 0.04045 {
-            v / 12.92
-        } else {
-            ((v + 0.055) / 1.055).powf(2.4)
-        }
-    };
+    // Every cell's colors pass through here; three `powf` per color showed up
+    // as a large part of building a row.
+    static LINEAR: std::sync::LazyLock<[f32; 256]> =
+        std::sync::LazyLock::new(|| std::array::from_fn(|c| channel(c as u8, true)));
+    let channel = |c: u8| if srgb { LINEAR[usize::from(c)] } else { channel(c, false) };
     [channel(color[0]), channel(color[1]), channel(color[2]), 1.0]
+}
+
+/// One color channel as the shader expects it: linear for an sRGB surface.
+fn channel(c: u8, srgb: bool) -> f32 {
+    let v = f32::from(c) / 255.0;
+    if !srgb {
+        v
+    } else if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 pub struct CellPipeline {
