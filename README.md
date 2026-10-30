@@ -370,15 +370,16 @@ a new attach.
 
 ## Performance
 
-`cat` of large files at 100x30 on Fedora, Wayland, RTX 2070 SUPER. Median of
-five runs, lower is better.
+`cat` of large files at 100x30 on Fedora, Wayland, Ryzen 7 3700X, RTX 2070
+SUPER, each terminal with its default settings. Median of nine runs with
+`cargo xtask bench e2e --cpus 0-7` and `startup --cpus 0-7`, lower is better.
 
-| Workload | tron | Alacritty 0.17 | Ghostty 1.3 |
+| Workload | tron | Alacritty 0.17 | Ghostty 1.4 |
 |---|---|---|---|
-| Plain ASCII, 54 MiB | 689 ms | 868 ms | 1173 ms |
-| True color SGR, 44 MiB | 611 ms | 728 ms | 2969 ms |
-| Unicode and CJK, 31 MiB | 453 ms | 449 ms | 632 ms |
-| Launch until the shell runs | 55 ms | 138 ms | 419 ms |
+| Plain ASCII, 54 MiB | 692 ms | 858 ms | 730 ms |
+| True color SGR, 44 MiB | 572 ms | 673 ms | 1157 ms |
+| Unicode and CJK, 31 MiB | 334 ms | 455 ms | 379 ms |
+| Launch until a command runs | 57 ms | 139 ms | 385 ms |
 
 Headless parser throughput (about 500 MiB/s plain ASCII, 270 MiB/s true
 color SGR, 200 MiB/s Unicode on the same machine):
