@@ -779,7 +779,8 @@ do_install() {
 	confirm_change
 
 	if [ "$method" = prebuilt ]; then
-		if [ -z "$src" ]; then
+		# src may be a checkout found for building; only an unpacked archive sets binary.
+		if [ -z "$binary" ]; then
 			download_release
 			binary=$src/tron
 		fi
