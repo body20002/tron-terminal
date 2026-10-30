@@ -9,8 +9,6 @@ app-id: dev.tron.Terminal
 runtime: org.freedesktop.Platform
 runtime-version: "26.08"
 sdk: org.freedesktop.Sdk
-sdk-extensions:
-  - org.freedesktop.Sdk.Extension.rust-stable
 command: tron
 finish-args:
   - --share=ipc
@@ -22,16 +20,21 @@ finish-args:
   - --talk-name=org.freedesktop.Notifications
   - --talk-name=org.a11y.Bus
 build-options:
-  append-path: /usr/lib/sdk/rust-stable/bin
+  append-path: /run/build/tron/cargo-home/bin
   # Crates are downloaded during the build; the bundle is not built for Flathub.
   build-args:
     - --share=network
   env:
     CARGO_HOME: /run/build/tron/cargo-home
+    RUSTUP_HOME: /run/build/tron/rustup-home
 modules:
   - name: tron
     buildsystem: simple
     build-commands:
+      # The Flathub rust-stable extension trails stable Rust and can fall below
+      # rust-version, so rustup installs the latest stable, as in the other
+      # release jobs.
+      - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path
       - cargo build --release --locked -p tron
       - install -Dm755 target/release/tron /app/bin/tron
       - install -Dm644 dist/dev.tron.Terminal.desktop /app/share/applications/dev.tron.Terminal.desktop
