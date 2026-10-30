@@ -1,0 +1,3 @@
+[alias]
+# Project tasks, such as `cargo xtask bench`. See `xtask/src/main.rs`.
+xtask = "run --quiet --package xtask --"

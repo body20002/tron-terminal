@@ -8,6 +8,10 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Exposes the cell pipeline to the benchmarks in `benches/`.
+bench = []
+
 [dependencies]
 tron-core.workspace = true
 tron-font.workspace = true
@@ -23,3 +27,15 @@ foldhash.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-quartz-core.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[test]]
+name = "incremental_frames"
+required-features = ["bench"]
+
+[[bench]]
+name = "cells"
+harness = false
+required-features = ["bench"]

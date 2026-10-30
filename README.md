@@ -384,6 +384,22 @@ Headless parser throughput (about 500 MiB/s plain ASCII, 270 MiB/s true
 color SGR, 200 MiB/s Unicode on the same machine):
 `cargo run --release -p tron-core --example throughput`.
 
+Measuring:
+
+```sh
+cargo xtask bench e2e        # the `cat` workloads above, in each installed terminal
+cargo xtask bench startup    # launch until a command in the terminal runs
+cargo xtask bench headless   # parser throughput, no window
+cargo xtask bench cells      # snapshot, cell build and upload per frame (criterion)
+```
+
+`e2e` and `startup` run every terminal with its default settings, check the
+grid is 100x30 and append results to `target/bench/history.csv`. `--tron PATH`
+measures another tron build, `--runs`, `--terminals` and `--cases` narrow a run.
+Timings fall into two clusters depending on which cores the scheduler picks;
+`--cpus 0-7` (physical cores, no SMT siblings, on an 8-core CPU) keeps them in one
+for comparing builds.
+
 ## Architecture
 
 | Crate | Purpose |

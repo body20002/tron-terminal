@@ -10,6 +10,9 @@
 //! slots form a ring, so a scroll moves the ring's start, not the instances.
 
 mod atlas;
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub mod bench;
 mod cells;
 mod compile;
 mod images;
