@@ -424,10 +424,24 @@ impl Terminal {
         let grid = &self.grids[self.active];
         let rows = grid.rows();
         let resized = snapshot.rows.len() != rows || snapshot.cols != grid.cols();
+        // Rows the screen scrolled keep their copies, moved up, when the viewport
+        // followed the text: same screen, bottom of history, lines renumbered
+        // with the scroll. Otherwise every row is copied again.
+        let scrolled = grid.scrolled();
+        let follows = scrolled > 0
+            && scrolled < rows
+            && !resized
+            && snapshot.alt_screen == (self.active == ALTERNATE)
+            && snapshot.display_offset == 0
+            && grid.display_offset() == 0
+            && grid.viewport_line(0) - snapshot.top_line == scrolled as i64;
+        let full = resized || (scrolled > 0 && !follows);
+        snapshot.shift = if follows { scrolled } else { 0 };
         snapshot.rows.resize_with(rows, || crate::grid::Row::new(0));
+        snapshot.rows.rotate_left(snapshot.shift);
         snapshot.damaged.resize(rows, false);
         for y in 0..rows {
-            let damaged = resized || grid.is_damaged(y);
+            let damaged = full || grid.is_damaged(y);
             snapshot.damaged[y] = damaged;
             if damaged {
                 snapshot.rows[y].copy_from(grid.visible_row(y));
@@ -3388,5 +3402,71 @@ mod tests {
         t.resize(10, 4);
         assert_eq!(line(&t, 0), "a");
         assert_eq!(t.cursor().row, 3);
+    }
+
+    /// Rows of an incremental snapshot, which moves scrolled rows instead of
+    /// copying them, must match a snapshot copied from scratch.
+    fn assert_snapshot_current(t: &mut Terminal, kept: &mut crate::Snapshot, step: &str) {
+        t.snapshot(kept);
+        let mut fresh = crate::Snapshot::default();
+        // A fresh snapshot copies every row whatever the damage says.
+        t.snapshot(&mut fresh);
+        assert_eq!(kept.rows(), fresh.rows(), "{step}");
+        for (y, (a, b)) in kept.rows.iter().zip(&fresh.rows).enumerate() {
+            let same = a.cells == b.cells
+                && a.wrapped == b.wrapped
+                && a.line_size == b.line_size
+                && (0..a.cells.len()).all(|col| a.combining(col) == b.combining(col));
+            assert!(same, "row {y} differs after {step}");
+        }
+    }
+
+    #[test]
+    fn scrolled_rows_move_in_the_snapshot_instead_of_being_copied() {
+        let mut t = term(20, 5, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        let mut snapshot = crate::Snapshot::default();
+        t.snapshot(&mut snapshot);
+        Parser::new().advance(&mut t, b"\r\nsix\r\nseven");
+        t.snapshot(&mut snapshot);
+        assert_eq!(snapshot.shift, 2);
+        assert_eq!(snapshot.damaged, [false, false, false, true, true]);
+        let text: Vec<String> =
+            snapshot.rows.iter().map(|r| r.cells.iter().map(|c| c.ch).filter(|&c| c != '\0').collect()).collect();
+        assert_eq!(text, ["three", "four", "five", "six", "seven"]);
+    }
+
+    #[test]
+    fn incremental_snapshots_match_fresh_ones() {
+        let mut t = term(20, 5, b"");
+        let mut parser = Parser::new();
+        let mut kept = crate::Snapshot::default();
+        let steps: &[(&str, &[u8])] = &[
+            ("first lines", b"a\r\nb\r\nc"),
+            ("scroll by some", b"\x1b[5;1Hd\r\ne\r\nf"),
+            ("edit then scroll", b"\x1b[2;3Hxx\x1b[5;1H\r\ng"),
+            ("scroll by more than the screen", b"\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7"),
+            ("scroll region", b"\x1b[2;4r\x1b[4;1H\nh\ni\x1b[r\x1b[5;1H"),
+            ("scroll up and down", b"\x1b[2S\x1b[H\x1bMtop\x1b[5;1H\r\nj"),
+            ("wide and combining", "\r\n中文e\u{301}\r\nk".as_bytes()),
+            ("double width", b"\x1b#6wide\r\nl"),
+            ("alternate screen", b"\x1b[?1049halt\r\n\r\n\r\n\r\n\r\nm\x1b[?1049l\r\nn"),
+            ("clear", b"\x1b[2J\x1b[Ho\r\np"),
+            ("clear history", b"\x1b[3J\r\nq\r\nr"),
+        ];
+        for (step, input) in steps {
+            parser.advance(&mut t, input);
+            assert_snapshot_current(&mut t, &mut kept, step);
+        }
+        // Output while scrolled into history, then back at the bottom.
+        t.grid_mut().scroll_display(2);
+        assert_snapshot_current(&mut t, &mut kept, "scrolled into history");
+        parser.advance(&mut t, b"\r\ns\r\nt");
+        assert_snapshot_current(&mut t, &mut kept, "output while scrolled");
+        t.grid_mut().reset_display_offset();
+        parser.advance(&mut t, b"\r\nu");
+        assert_snapshot_current(&mut t, &mut kept, "back at the bottom");
+        t.resize(15, 4);
+        parser.advance(&mut t, b"\r\nv\r\nw");
+        assert_snapshot_current(&mut t, &mut kept, "resized");
     }
 }

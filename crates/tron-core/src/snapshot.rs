@@ -19,6 +19,9 @@ pub struct Snapshot {
     pub rows: Vec<Row>,
     /// Rows that changed since the previous snapshot.
     pub damaged: Vec<bool>,
+    /// Rows the viewport moved up by since the previous snapshot: what was row
+    /// `y + shift` then is row `y` now. Rows that only moved are not damaged.
+    pub shift: usize,
     pub cols: usize,
     /// Absolute line number of the top viewport row.
     pub top_line: i64,

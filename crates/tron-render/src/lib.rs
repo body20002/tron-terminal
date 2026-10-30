@@ -5,7 +5,8 @@
 //! decorations, images above text. With user shaders configured, the pass
 //! renders into a texture that the shader chain then processes.
 //!
-//! Cell instances are cached per row and rebuilt only for damaged rows.
+//! Cell instances are cached per row and rebuilt only for damaged rows; rows
+//! the screen scrolled keep their instances and move up with it.
 
 mod atlas;
 mod cells;

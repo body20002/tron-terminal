@@ -245,6 +245,9 @@ pub struct Grid {
     display_offset: usize,
     damage: Vec<bool>,
     full_damage: bool,
+    /// Full screen scrolls since damage was last cleared: rows moved up by this
+    /// many. Damage moves along with them.
+    scrolled: usize,
     /// Set by the last reflow, taken by [`Grid::take_line_map`].
     line_map: Option<LineMap>,
 }
@@ -262,6 +265,7 @@ impl Grid {
             display_offset: 0,
             damage: vec![true; rows],
             full_damage: true,
+            scrolled: 0,
             line_map: None,
         }
     }
@@ -400,9 +404,17 @@ impl Grid {
         self.full_damage = true;
     }
 
+    /// Rows the screen moved up by since damage was last cleared. Rows that
+    /// moved without changing are not damaged; whoever copied them before can
+    /// move the copies instead of copying again.
+    pub fn scrolled(&self) -> usize {
+        self.scrolled
+    }
+
     pub fn clear_damage(&mut self) {
         self.full_damage = false;
         self.damage.fill(false);
+        self.scrolled = 0;
     }
 
     fn trim_scrollback(&mut self) {
@@ -462,7 +474,10 @@ impl Grid {
             }
         }
         if top == 0 && bottom + 1 == self.rows {
-            self.full_damage = true;
+            // Damage moves up with the rows; the new rows at the bottom are damaged.
+            self.damage.rotate_left(n);
+            self.damage[self.rows - n..].fill(true);
+            self.scrolled += n;
         } else {
             self.damage[top..=bottom].fill(true);
         }

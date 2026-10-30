@@ -607,12 +607,25 @@ impl CellPipeline {
         srgb: bool,
         viewport: [f32; 2],
     ) {
+        self.follow_shift(snapshot);
         for _ in 0..4 {
             self.atlas_full = None;
             self.build(queue, snapshot, fonts, theme, focused, srgb, viewport);
             let Some(format) = self.atlas_full else { break };
             self.grow_atlas(device, format);
         }
+    }
+
+    /// Moves row instances up with rows the snapshot says scrolled, so only the
+    /// rows that changed are built again.
+    fn follow_shift(&mut self, snapshot: &Snapshot) {
+        let shift = snapshot.shift;
+        if shift == 0 || self.rows.len() != snapshot.rows() || self.full_rebuild {
+            return;
+        }
+        self.rows.rotate_left(shift);
+        // The row the cursor was drawn in moved too, or left the screen.
+        self.last_cursor = self.last_cursor.and_then(|(row, col)| Some((row.checked_sub(shift)?, col)));
     }
 
     fn grow_atlas(&mut self, device: &wgpu::Device, format: GlyphFormat) {
